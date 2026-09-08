@@ -1,0 +1,38 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isAdmin() { return request.auth != null; }
+
+    match /raizenRoyale_games/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /raizenRoyale_payments/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /raizenRoyale_stats/{id} {
+      allow read: if isAdmin();
+      allow create, update: if true;
+      allow delete: if isAdmin();
+    }
+    match /raizenRoyale_cashouts/{id} {
+      allow read: if isAdmin();
+      allow create: if request.resource.data.status == 'pending'
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.game is string
+        && request.resource.data.gameUsername is string
+        && request.resource.data.paymentMethod is string
+        && request.resource.data.paymentDetails is string;
+      allow update, delete: if isAdmin();
+    }
+    match /raizenRoyale/{docId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /raizenRoyale_transactions/{id} {
+      allow read, write: if isAdmin();
+    }
+  }
+}
