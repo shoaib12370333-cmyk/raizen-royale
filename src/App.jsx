@@ -816,8 +816,74 @@ function CashTapPay({ enabled, games }) {
   const t = useText();
   const [amount, setAmount] = useState("");
   const [selectedGame, setSelectedGame] = useState("");
-  const [status, setStatus] = useState("idle"); // idle | creating | redirecting | error
+  const [status, setStatus] = useState("idle"); // idle | creating | redirecting | checking | paid | failed | error
   const [error, setError] = useState("");
+  const [paidUsd, setPaidUsd] = useState(null);
+  const [paidAt, setPaidAt] = useState(null);
+  const [sessionId, setSessionId] = useState(null);
+  const canvasRef = React.useRef(null);
+
+  // On mount, if we've just come back from CashTap's hosted checkout,
+  // pick up the pending session and confirm its real status via polling.
+  // We never trust the success_url redirect alone — only a confirmed
+  // "completed" status from checkout-status.js counts as paid.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const returnedPaid = params.get("paid");
+    const pending = sessionStorage.getItem("rr_cashtap_pending");
+    if (returnedPaid && pending) {
+      try {
+        const parsed = JSON.parse(pending);
+        setSessionId(parsed.id);
+        setPaidUsd(parsed.amount);
+        setSelectedGame(parsed.game || "");
+        setStatus("checking");
+      } catch (err) {
+        sessionStorage.removeItem("rr_cashtap_pending");
+      }
+      // Clean the URL so refreshing doesn't re-trigger this.
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (status !== "checking" || !sessionId) return;
+    let cancelled = false;
+    let attempts = 0;
+    const maxAttempts = 12; // ~60s at 5s intervals, matching CashTap's own polling guidance
+
+    const poll = async () => {
+      attempts += 1;
+      try {
+        const res = await fetch(`/api/checkout-status?session_id=${sessionId}`);
+        const data = await res.json();
+        if (cancelled) return;
+        if (data.status === "completed") {
+          setPaidAt(new Date());
+          setStatus("paid");
+          sessionStorage.removeItem("rr_cashtap_pending");
+          return;
+        }
+        if (data.status === "expired" || data.status === "failed") {
+          setStatus("failed");
+          sessionStorage.removeItem("rr_cashtap_pending");
+          return;
+        }
+      } catch (err) {
+        // keep trying silently
+      }
+      if (attempts >= maxAttempts) {
+        if (!cancelled) setStatus("failed");
+        return;
+      }
+      if (!cancelled) setTimeout(poll, 5000);
+    };
+
+    poll();
+    return () => {
+      cancelled = true;
+    };
+  }, [status, sessionId]);
 
   if (!enabled) return null;
 
@@ -844,6 +910,7 @@ function CashTapPay({ enabled, games }) {
       if (!res.ok || !data.url) {
         throw new Error((data.error && data.error.message) || "Could not start checkout.");
       }
+      sessionStorage.setItem("rr_cashtap_pending", JSON.stringify({ id: data.id, amount: usd, game: selectedGame }));
       setStatus("redirecting");
       window.location.href = data.url;
     } catch (err) {
@@ -852,32 +919,166 @@ function CashTapPay({ enabled, games }) {
     }
   };
 
+  const drawReceipt = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const W = 600, H = 680;
+    canvas.width = W;
+    canvas.height = H;
+
+    ctx.fillStyle = "#0b0906";
+    ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = "#4a380f";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(16, 16, W - 32, H - 32);
+
+    ctx.fillStyle = "#F5CD5C";
+    ctx.font = "bold 30px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("RAIZEN ROYALE", W / 2, 80);
+    ctx.fillStyle = "#9C8F72";
+    ctx.font = "13px sans-serif";
+    ctx.fillText("PAYMENT RECEIPT", W / 2, 105);
+
+    ctx.strokeStyle = "#332711";
+    ctx.beginPath();
+    ctx.moveTo(60, 130);
+    ctx.lineTo(W - 60, 130);
+    ctx.stroke();
+
+    ctx.fillStyle = "#1a3d1a";
+    ctx.fillRect(W / 2 - 70, 155, 140, 40);
+    ctx.fillStyle = "#7fbf6a";
+    ctx.font = "bold 18px sans-serif";
+    ctx.fillText("\u2713 PAID", W / 2, 181);
+
+    ctx.fillStyle = "#F2E7CE";
+    ctx.font = "bold 44px sans-serif";
+    ctx.fillText(`$${paidUsd ? paidUsd.toFixed(2) : "0.00"}`, W / 2, 260);
+
+    const details = [
+      ["Game", selectedGame || "\u2014"],
+      ["Method", "Card / Bank / CashApp"],
+      ["Date", (paidAt || new Date()).toLocaleString()],
+      ["Session ID", sessionId || "\u2014"],
+    ];
+    let y = 320;
+    ctx.textAlign = "left";
+    details.forEach(([label, value]) => {
+      ctx.fillStyle = "#6B5F48";
+      ctx.font = "13px sans-serif";
+      ctx.fillText(label.toUpperCase(), 70, y);
+      ctx.fillStyle = "#F2E7CE";
+      ctx.font = "16px sans-serif";
+      ctx.fillText(value, 70, y + 22);
+      y += 60;
+    });
+
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#6B5F48";
+    ctx.font = "12px sans-serif";
+    ctx.fillText("Keep this receipt as proof of payment", W / 2, H - 50);
+    ctx.fillStyle = "#E3B23C";
+    ctx.font = "bold 14px sans-serif";
+    ctx.fillText("\u265B raizenroyale.shop", W / 2, H - 28);
+  };
+
+  useEffect(() => {
+    if (status === "paid") {
+      setTimeout(drawReceipt, 50);
+    }
+  }, [status]);
+
+  const downloadReceipt = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const link = document.createElement("a");
+    link.download = `raizen-royale-receipt-${Date.now()}.png`;
+    link.href = canvas.toDataURL("image/png");
+    link.click();
+  };
+
+  const reset = () => {
+    setAmount("");
+    setSelectedGame("");
+    setStatus("idle");
+    setError("");
+    setPaidUsd(null);
+    setPaidAt(null);
+    setSessionId(null);
+    sessionStorage.removeItem("rr_cashtap_pending");
+  };
+
   return (
     <div className="rr-card" style={{ padding: 24, marginBottom: 28, maxWidth: 420 }}>
       <div className="rr-display" style={{ color: TEXT, fontSize: 16, fontWeight: 700, textTransform: "uppercase", marginBottom: 4 }}>
         {t.cashtapTitle}
       </div>
       <div style={{ color: TEXT_DIM, fontSize: 13, marginBottom: 16 }}>{t.cashtapSubtitle}</div>
-      <form onSubmit={startCheckout} style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        <input
-          value={amount}
-          onChange={(e) => setAmount(e.target.value.replace(/[^0-9.]/g, ""))}
-          placeholder="Amount in USD (e.g. 5.00)"
-          className="rr-input"
-        />
-        {games && games.length > 0 ? (
-          <select value={selectedGame} onChange={(e) => setSelectedGame(e.target.value)} className="rr-input" style={{ cursor: "pointer" }}>
-            <option value="">For which game? (optional)</option>
-            {games.map((g) => (
-              <option key={g.id} value={g.name}>{g.name}</option>
-            ))}
-          </select>
-        ) : null}
-        {error ? <div style={{ color: EMBER_BRIGHT, fontSize: 13 }}>{error}</div> : null}
-        <button type="submit" className="rr-btn-primary" style={{ padding: "10px 0", fontSize: 14 }} disabled={status === "creating" || status === "redirecting"}>
-          {status === "creating" ? "Preparing checkout..." : status === "redirecting" ? "Redirecting..." : t.continueCheckoutBtn}
-        </button>
-      </form>
+
+      {status === "idle" || status === "error" || status === "creating" || status === "redirecting" ? (
+        <form onSubmit={startCheckout} style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <input
+            value={amount}
+            onChange={(e) => setAmount(e.target.value.replace(/[^0-9.]/g, ""))}
+            placeholder="Amount in USD (e.g. 5.00)"
+            className="rr-input"
+          />
+          {games && games.length > 0 ? (
+            <select value={selectedGame} onChange={(e) => setSelectedGame(e.target.value)} className="rr-input" style={{ cursor: "pointer" }}>
+              <option value="">For which game? (optional)</option>
+              {games.map((g) => (
+                <option key={g.id} value={g.name}>{g.name}</option>
+              ))}
+            </select>
+          ) : null}
+          {error ? <div style={{ color: EMBER_BRIGHT, fontSize: 13 }}>{error}</div> : null}
+          <button type="submit" className="rr-btn-primary" style={{ padding: "10px 0", fontSize: 14 }} disabled={status === "creating" || status === "redirecting"}>
+            {status === "creating" ? "Preparing checkout..." : status === "redirecting" ? "Redirecting..." : t.continueCheckoutBtn}
+          </button>
+        </form>
+      ) : null}
+
+      {status === "checking" ? (
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 14, textAlign: "center" }}>
+          <div style={{ color: GOLD, fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
+            <span className="rr-crest-gem" style={{ width: 8, height: 8, borderRadius: "50%", background: GOLD, display: "inline-block" }} />
+            Confirming your payment...
+          </div>
+          <div style={{ color: TEXT_DIM, fontSize: 13 }}>This usually takes a few seconds.</div>
+        </div>
+      ) : null}
+
+      {status === "paid" ? (
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 14 }}>
+          <div style={{ color: "#7fbf6a", fontSize: 32 }}>&#10003;</div>
+          <div className="rr-display" style={{ color: TEXT, fontSize: 16, fontWeight: 700 }}>Payment received!</div>
+          <canvas ref={canvasRef} style={{ width: "100%", maxWidth: 300, borderRadius: 6, border: `1px solid ${BORDER}` }} />
+          <button type="button" onClick={downloadReceipt} className="rr-btn-primary" style={{ padding: "10px 20px", fontSize: 14, width: "100%" }}>
+            Download receipt
+          </button>
+          <div style={{ color: TEXT_FAINT, fontSize: 12, textAlign: "center" }}>
+            Save this image and send it to us as proof of payment.
+          </div>
+          <button type="button" onClick={reset} className="rr-btn-ghost" style={{ padding: "7px 14px", fontSize: 12 }}>
+            Make another payment
+          </button>
+        </div>
+      ) : null}
+
+      {status === "failed" ? (
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 14, textAlign: "center" }}>
+          <div style={{ color: EMBER_BRIGHT, fontSize: 32 }}>&#9888;</div>
+          <div className="rr-display" style={{ color: TEXT, fontSize: 16, fontWeight: 700 }}>Payment not confirmed</div>
+          <div style={{ color: TEXT_DIM, fontSize: 13 }}>
+            We couldn't confirm this payment. If money left your account, contact support with your session ID: {sessionId}
+          </div>
+          <button type="button" onClick={reset} className="rr-btn-primary" style={{ padding: "10px 20px", fontSize: 14 }}>
+            Try again
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }
