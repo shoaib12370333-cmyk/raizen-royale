@@ -1,7 +1,10 @@
-import React, { useState, useEffect, useMemo } from "react";
-import { auth, signInWithEmailAndPassword } from "./firebase.js";
+import React, { useState, useEffect, useMemo, useRef } from "react";
+import { auth, signInWithEmailAndPassword, signOut } from "./firebase.js";
 import { DEFAULT_TEXT, DEFAULT_CASHOUT_FIELDS, DEFAULT_SETTINGS, TEXT_GROUPS, useText } from "./text.js";
 import { Icon, Crest, CountUp, Switch, Field, Modal, Spinner, useToast, uid, fileToDataUrl } from "./ui.jsx";
+import { useAdminChats, useAdminMarker, isAdminUser } from "./chat.js";
+import { playPing, readSoundPref, writeSoundPref } from "./notify.js";
+import AdminChat from "./AdminChat.jsx";
 
 /* =========================================================
    Login
@@ -20,6 +23,12 @@ export function LoginPage({ onLogin }) {
     setError("");
     try {
       await signInWithEmailAndPassword(auth, user.trim(), pass);
+      if (!isAdminUser(auth.currentUser)) {
+        // A chat visitor's account must not open the admin panel.
+        await signOut(auth);
+        setError("Incorrect email or password.");
+        return;
+      }
       onLogin();
     } catch {
       setError("Incorrect email or password.");
@@ -377,6 +386,7 @@ function SettingsEditor({ settings, setSettings }) {
     nowpaymentsEnabled: !!s.nowpaymentsEnabled,
     cashoutEnabled: s.cashoutEnabled !== false,
     cashoutMetaLink: s.cashoutMetaLink || "",
+    chatEnabled: !!s.chatEnabled,
   });
   const [d, setD] = useState(pick(settings));
   const dirty = JSON.stringify(d) !== JSON.stringify(pick(settings));
@@ -396,6 +406,7 @@ function SettingsEditor({ settings, setSettings }) {
       nowpaymentsEnabled: d.nowpaymentsEnabled,
       cashoutEnabled: d.cashoutEnabled,
       cashoutMetaLink: d.cashoutMetaLink.trim(),
+      chatEnabled: d.chatEnabled,
     });
     toast("Settings saved");
   };
@@ -430,6 +441,11 @@ function SettingsEditor({ settings, setSettings }) {
       </div>
 
       <div className="card card-pad">
+        <div className="panel-head"><div><h3>Live chat</h3><p>Shows a chat button to visitors. Turn it on only after the one-time Firebase setup (see the Live Chat tab).</p></div></div>
+        <Toggle k="chatEnabled" title="Enable live chat for visitors" desc="Visitors can chat as a guest or with a username and password, and you reply from the Live Chat tab." />
+      </div>
+
+      <div className="card card-pad">
         <div className="panel-head"><div><h3>Cash-Out</h3><p>Messenger username above takes priority and opens a pre-filled message.</p></div></div>
         <Toggle k="cashoutEnabled" title="Enable Cash-Out page" desc="Customers can submit cash-out requests." />
         <Field label="Cash-Out Meta/Facebook fallback link" className="full"><input value={d.cashoutMetaLink} onChange={set("cashoutMetaLink")} placeholder="https://facebook.com/yourpage" className="input" /></Field>
@@ -450,6 +466,7 @@ const TABS = [
   { id: "games", label: "Games", icon: "gamepad" },
   { id: "payments", label: "Payment methods", icon: "wallet" },
   { id: "cashout", label: "Cash-Out", icon: "cash" },
+  { id: "chat", label: "Live Chat", icon: "message" },
   { id: "analytics", label: "Analytics", icon: "chart" },
   { id: "text", label: "Site Text", icon: "type" },
   { id: "settings", label: "Settings", icon: "sliders" },
@@ -458,6 +475,27 @@ const TABS = [
 export function AdminPage({ games, saveGameItem, removeGameItem, payments, savePaymentItem, removePaymentItem, settings, setSettings, siteText, setSiteText, onLogout, stats, cashoutFields, saveCashoutFields, cashouts, onUpdateCashoutRequest }) {
   const toast = useToast();
   const [tab, setTab] = useState("games");
+  const [soundOn, setSoundOn] = useState(readSoundPref);
+  const soundRef = useRef(soundOn);
+  soundRef.current = soundOn;
+
+  // One live subscription for the whole dashboard so the badge and alerts work on every tab.
+  const chatState = useAdminChats((ev) => {
+    if (soundRef.current) playPing();
+    const c = ev.chat;
+    toast(ev.type === "opened" ? `${c.name} opened the chat` : `${c.name}: ${c.lastMessage}`);
+  });
+  const chatUnread = chatState.unreadTotal;
+  const marker = useAdminMarker();
+  const toggleSound = () => { const next = !soundOn; setSoundOn(next); writeSoundPref(next); };
+
+  useEffect(() => {
+    if (!chatUnread) return undefined;
+    const base = document.title;
+    document.title = `(${chatUnread}) ${base}`;
+    return () => { document.title = base; };
+  }, [chatUnread]);
+
   const [gameModal, setGameModal] = useState(null); // null | "new" | game
   const [payModal, setPayModal] = useState(null);
 
@@ -503,6 +541,7 @@ export function AdminPage({ games, saveGameItem, removeGameItem, payments, saveP
           <button key={x.id} className={`side-link ${tab === x.id ? "active" : ""}`} onClick={() => setTab(x.id)}>
             <Icon name={x.icon} size={19} /> {x.label}
             {x.id === "cashout" && pendingCount ? <span className="count">{pendingCount}</span> : null}
+            {x.id === "chat" && chatUnread ? <span className="count">{chatUnread}</span> : null}
           </button>
         ))}
         <div className="side-foot">
@@ -517,6 +556,22 @@ export function AdminPage({ games, saveGameItem, removeGameItem, payments, saveP
             <h1>{current.label}</h1>
           </div>
         </div>
+
+        {marker.status === "missing" ? (
+          <div className="error-box" role="alert" style={{ alignItems: "flex-start" }}>
+            <Icon name="alert" size={18} style={{ flexShrink: 0, marginTop: 2 }} />
+            <div>
+              <b>Admin marker missing: saving will not work.</b> The new security rules only treat you as admin if a document
+              exists at <code>raizenRoyale_admins/{marker.uid}</code> in Firestore. Create it in the Firebase console
+              (collection <code>raizenRoyale_admins</code>, Document ID = your UID, any field such as <code>enabled = true</code>). See the README.
+              <div style={{ marginTop: 10 }}>
+                <button type="button" className="btn btn-ghost btn-sm" onClick={() => { navigator.clipboard.writeText(marker.uid); toast("UID copied"); }}>
+                  <Icon name="copy" size={15} /> Copy my UID
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
 
         <div className="kpis">
           <div className="card kpi"><div className="ico"><Icon name="users" size={20} /></div><b className="gold-text"><CountUp value={stats.site_visits || 0} /></b><span>Site visits</span></div>
@@ -600,6 +655,8 @@ export function AdminPage({ games, saveGameItem, removeGameItem, payments, saveP
             )}
           </div>
         )}
+
+        {tab === "chat" && <AdminChat chats={chatState.chats} loading={chatState.loading} error={chatState.error} soundEnabled={soundOn} onToggleSound={toggleSound} />}
 
         {tab === "text" && <SiteTextEditor siteText={siteText} setSiteText={setSiteText} />}
         {tab === "settings" && <SettingsEditor settings={settings} setSettings={setSettings} />}

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, Suspense } from "react";
 import { Routes, Route, Link, NavLink, useLocation } from "react-router-dom";
 import { loadDoc, saveDoc, watchDoc, loadCollection, saveItem, deleteItem, watchCollection, watchCounters, auth, signOut, onAuthStateChanged } from "./firebase.js";
 import { DEFAULT_SETTINGS, DEFAULT_TEXT, DEFAULT_CASHOUT_FIELDS, SAMPLE_GAMES, TextContext, useText } from "./text.js";
@@ -7,7 +7,11 @@ import HomePage from "./Home.jsx";
 import PaymentsPage from "./Payments.jsx";
 import CashOutPage from "./CashOut.jsx";
 import { LoginPage, AdminPage } from "./Admin.jsx";
+import { isAdminUser } from "./chat.js";
 import "./styles.css";
+
+// Loaded only when live chat is switched on, so sites without chat do not pay for it.
+const ChatWidget = React.lazy(() => import("./ChatWidget.jsx"));
 
 /* ---------- Background ---------- */
 function Ambient() {
@@ -138,7 +142,8 @@ function Footer({ settings }) {
 /* ---------- Admin route guard ---------- */
 function AdminRoute({ isAdmin, setIsAdmin, ...rest }) {
   if (!isAdmin) {
-    return <LoginPage onLogin={() => setIsAdmin(true)} />;
+    // onAuthStateChanged flips isAdmin once the sign-in completes; nothing to do here.
+    return <LoginPage onLogin={() => {}} />;
   }
   return <AdminPage {...rest} onLogout={() => signOut(auth)} />;
 }
@@ -164,15 +169,16 @@ export default function App() {
 
   useEffect(() => {
     let mounted = true;
-    const unsubAuth = onAuthStateChanged(auth, (user) => setIsAdmin(!!user));
+    // Chat visitors (guests / chat accounts) are signed in too, so "signed in" no longer means admin.
+    // This only decides whether to show the admin panel; Firestore rules are the real gate.
+    const unsubAuth = onAuthStateChanged(auth, (user) => setIsAdmin(isAdminUser(user)));
     (async () => {
-      const [g, p, s, txt, cf, co] = await Promise.all([
+      const [g, p, s, txt, cf] = await Promise.all([
         loadCollection("games", SAMPLE_GAMES),
         loadCollection("payments", []),
         loadDoc("settings", DEFAULT_SETTINGS),
         loadDoc("siteText", DEFAULT_TEXT),
         loadDoc("cashoutFields", null),
-        loadCollection("cashouts", []),
       ]);
       if (mounted) {
         setGamesState(g);
@@ -180,7 +186,6 @@ export default function App() {
         setSettingsState({ ...DEFAULT_SETTINGS, ...s });
         setSiteTextState({ ...DEFAULT_TEXT, ...txt });
         if (cf && Array.isArray(cf) && cf.length) setCashoutFieldsState(cf);
-        setCashouts(co);
         setLoaded(true);
       }
     })();
@@ -189,9 +194,7 @@ export default function App() {
     const unsubPayments = watchCollection("payments", (v) => setPaymentsState(v));
     const unsubSettings = watchDoc("settings", (v) => setSettingsState({ ...DEFAULT_SETTINGS, ...v }));
     const unsubText = watchDoc("siteText", (v) => setSiteTextState({ ...DEFAULT_TEXT, ...v }));
-    const unsubStats = watchCounters((v) => setStats(v));
     const unsubCashoutFields = watchDoc("cashoutFields", (v) => { if (Array.isArray(v) && v.length) setCashoutFieldsState(v); });
-    const unsubCashouts = watchCollection("cashouts", (v) => setCashouts(v));
 
     return () => {
       mounted = false;
@@ -199,12 +202,26 @@ export default function App() {
       unsubPayments();
       unsubSettings();
       unsubText();
-      unsubStats();
       unsubCashoutFields();
-      unsubCashouts();
       unsubAuth();
     };
   }, []);
+
+  // Cash-out requests and stats are admin-only in the rules. Subscribe only once the admin is
+  // signed in (a listener started while signed out is rejected and never retries after login).
+  useEffect(() => {
+    if (!isAdmin) {
+      setCashouts([]);
+      setStats({});
+      return undefined;
+    }
+    const unsubStats = watchCounters((v) => setStats(v));
+    const unsubCashouts = watchCollection("cashouts", (v) => setCashouts(v));
+    return () => {
+      unsubStats();
+      unsubCashouts();
+    };
+  }, [isAdmin]);
 
   const saveGameItem = useCallback((item) => saveItem("games", item), []);
   const removeGameItem = useCallback((id) => { deleteItem("games", id); }, []);
@@ -274,6 +291,11 @@ export default function App() {
           <Footer settings={settings} />
         </div>
         <Dock metaLink={settings.metaLink} />
+        {settings.chatEnabled && !isAdmin && !location.pathname.startsWith("/admin") ? (
+          <Suspense fallback={null}>
+            <ChatWidget />
+          </Suspense>
+        ) : null}
       </ToastProvider>
     </TextContext.Provider>
   );
