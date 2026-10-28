@@ -11,6 +11,7 @@ export const DEFAULT_SETTINGS = {
   nowpaymentsEnabled: false,
   cashoutEnabled: true,
   cashoutMetaLink: "",
+  chatEnabled: false, // stays off until the Firebase chat setup in the README is done
   cashoutMessageTemplate: "Hello, I would like to request a cash-out.\n\nGame: {game}\nGame Username: {username}\nCash-Out Amount: ${amount}\nPayment Method: {method}\nPayment Details: {details}\nRequest ID: {requestId}",
 };
 
@@ -74,6 +75,11 @@ export const DEFAULT_TEXT = {
   nowpaymentsSubtitle: "Opens a secure checkout in a new tab.",
   continueCheckoutBtn: "Continue to checkout",
 
+  chatTitle: "Live support",
+  chatSubtitle: "We usually reply within a few minutes",
+  chatWelcome: "Hi! How can we help you today?",
+  chatPlaceholder: "Type your message...",
+
   loginTitle: "Admin access",
   loginUsernamePlaceholder: "Admin email",
   loginPasswordPlaceholder: "Password",
@@ -90,6 +96,7 @@ export const TEXT_GROUPS = [
   { title: "Payments page", fields: [["paymentsEyebrow", "Eyebrow"], ["paymentsTitle", "Title"], ["paymentsSubtitle", "Subtitle"], ["noPaymentsText", "\"No payment methods\" message"], ["openLinkBtn", "\"Open link\" button"]] },
   { title: "Lightning payment", fields: [["lightningTitle", "Title"], ["lightningSubtitle", "Subtitle"], ["lightningAmountPlaceholder", "Amount field placeholder"], ["lightningGamePlaceholder", "Game dropdown placeholder"], ["lightningGenerateBtn", "\"Generate invoice\" button"], ["lightningWaitingText", "Waiting-for-scan text"], ["lightningCopyBtn", "\"Copy invoice\" button"], ["lightningWaitingStatus", "\"Waiting for payment...\" status"], ["lightningPaidText", "\"Payment received!\" text"], ["lightningDownloadReceiptBtn", "\"Download receipt\" button"], ["lightningReceiptNote", "Receipt reminder note"], ["lightningExpiredTitle", "\"Invoice expired\" title"], ["lightningExpiredText", "\"Invoice expired\" text"], ["lightningNewInvoiceBtn", "\"Generate new invoice\" button"]] },
   { title: "Card / CashApp payments", fields: [["cashtapTitle", "CashTap section title"], ["cashtapSubtitle", "CashTap section subtitle"], ["nowpaymentsTitle", "NOWPayments section title"], ["nowpaymentsSubtitle", "NOWPayments section subtitle"], ["continueCheckoutBtn", "\"Continue to checkout\" button"]] },
+  { title: "Live chat", fields: [["chatTitle", "Chat window title"], ["chatSubtitle", "Chat window subtitle"], ["chatWelcome", "Welcome message (shown before the first reply)"], ["chatPlaceholder", "Message box placeholder"]] },
   { title: "Login page", fields: [["loginTitle", "Title"], ["loginUsernamePlaceholder", "Username field placeholder"], ["loginPasswordPlaceholder", "Password field placeholder"], ["loginBtn", "\"Log in\" button"]] },
   { title: "Footer", fields: [["footerConnectText", "\"Connect with us\" text"]] },
 ];

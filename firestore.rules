@@ -1,7 +1,22 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    function isAdmin() { return request.auth != null; }
+
+    // ADMIN CHECK
+    // Chat visitors (guests and username/password accounts) are also signed in to Firebase,
+    // so "signed in" can no longer mean "admin". An admin is a signed-in user that has a
+    // document at raizenRoyale_admins/{their-uid}. Create that document once, by hand, in the
+    // Firebase console (see README, "Live chat setup"). Clients can never write to it.
+    function isSignedIn() { return request.auth != null; }
+    function isAdmin() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/raizenRoyale_admins/$(request.auth.uid));
+    }
+
+    match /raizenRoyale_admins/{uid} {
+      allow get: if isSignedIn() && request.auth.uid == uid;
+      allow list, write: if false;
+    }
 
     match /raizenRoyale_games/{id} {
       allow read: if true;
@@ -33,6 +48,102 @@ service cloud.firestore {
     }
     match /raizenRoyale_transactions/{id} {
       allow read, write: if isAdmin();
+    }
+
+    // LIVE CHAT
+    // One conversation per visitor. The document id is the visitor's own auth uid, so a
+    // visitor can only ever touch their own conversation. The admin can read and write all.
+    // The owner checks come first so ordinary visitors never pay for the admin lookup.
+    match /raizenRoyale_chats/{chatId} {
+      function chatPath(id) { return /databases/$(database)/documents/raizenRoyale_chats/$(id); }
+      function isOwner() { return isSignedIn() && request.auth.uid == chatId; }
+
+      // A timestamp field may only ever hold the server time of this write (or be absent on create),
+      // so a visitor cannot fake "online", pin their chat to the top, or delete the field to hide it.
+      function stampedOnCreate(k) { return !(k in request.resource.data) || request.resource.data[k] == request.time; }
+      function stampedOnUpdate(k) {
+        return !(k in request.resource.data.diff(resource.data).affectedKeys())
+          || request.resource.data[k] == request.time;
+      }
+
+      allow read: if isOwner() || isAdmin();
+
+      allow create: if isOwner()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['uid', 'name', 'isGuest', 'lastMessage', 'lastMessageAt',
+             'lastActivityAt', 'lastOpenedAt', 'lastSeenAt', 'lastSender', 'unreadAdmin', 'unreadUser'])
+        && request.resource.data.keys().hasAll(['uid', 'lastActivityAt'])
+        && request.resource.data.lastActivityAt == request.time
+        && stampedOnCreate('lastMessageAt')
+        && stampedOnCreate('lastOpenedAt')
+        && stampedOnCreate('lastSeenAt')
+        && request.resource.data.get('name', 'Guest') is string
+        && request.resource.data.get('name', 'Guest').size() <= 40
+        && request.resource.data.get('isGuest', true) is bool
+        && request.resource.data.get('lastSender', 'user') == 'user'
+        && request.resource.data.get('lastMessage', '') is string
+        && request.resource.data.get('lastMessage', '').size() <= 120
+        && request.resource.data.get('unreadAdmin', 0) in [0, 1]
+        && request.resource.data.get('unreadUser', 0) == 0;
+
+      allow update: if (isOwner()
+          && request.resource.data.uid == resource.data.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'isGuest', 'lastMessage',
+               'lastMessageAt', 'lastActivityAt', 'lastOpenedAt', 'lastSeenAt', 'lastSender', 'unreadAdmin', 'unreadUser'])
+          && stampedOnUpdate('lastMessageAt')
+          && stampedOnUpdate('lastActivityAt')
+          && stampedOnUpdate('lastOpenedAt')
+          && stampedOnUpdate('lastSeenAt')
+          && request.resource.data.get('name', 'Guest') is string
+          && request.resource.data.get('name', 'Guest').size() <= 40
+          && request.resource.data.get('isGuest', true) is bool
+          && request.resource.data.get('lastMessage', '') is string
+          && request.resource.data.get('lastMessage', '').size() <= 120
+          // A new preview must come with a new message time; the sender can only be the visitor.
+          && (!('lastMessage' in request.resource.data.diff(resource.data).affectedKeys())
+              || request.resource.data.lastMessageAt == request.time)
+          && (!('lastSender' in request.resource.data.diff(resource.data).affectedKeys())
+              || request.resource.data.lastSender == 'user')
+          // The visitor can only add one unread message at a time, and only clear their own unread count.
+          && (!('unreadAdmin' in request.resource.data.diff(resource.data).affectedKeys())
+              || (request.resource.data.unreadAdmin is int
+                  && request.resource.data.unreadAdmin == resource.data.get('unreadAdmin', 0) + 1))
+          && (!('unreadUser' in request.resource.data.diff(resource.data).affectedKeys())
+              || request.resource.data.unreadUser == 0))
+        || isAdmin();
+
+      allow delete: if isAdmin();
+
+      match /messages/{messageId} {
+        allow read: if isOwner() || isAdmin();
+
+        // Visitors can only add messages to their own conversation, as themselves, and only in the
+        // same batch that updates the conversation (so there are no orphan messages and every
+        // message shows up in the admin inbox).
+        allow create: if isOwner()
+          && request.resource.data.keys().hasOnly(['uid', 'sender', 'text', 'createdAt'])
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.sender == 'user'
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 1000
+          && request.resource.data.createdAt == request.time
+          && getAfter(chatPath(chatId)).data.lastMessageAt == request.time
+          && getAfter(chatPath(chatId)).data.lastSender == 'user';
+
+        // Only the admin can write as "admin".
+        allow create: if isAdmin()
+          && request.resource.data.keys().hasOnly(['uid', 'sender', 'text', 'createdAt'])
+          && request.resource.data.sender == 'admin'
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 1000
+          && request.resource.data.createdAt == request.time;
+
+        // Messages are immutable; only the admin can delete (used when clearing a conversation).
+        allow update: if false;
+        allow delete: if isAdmin();
+      }
     }
   }
 }
