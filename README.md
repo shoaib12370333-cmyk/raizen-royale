@@ -56,3 +56,12 @@ Notes:
 - To test as a visitor, use a different browser or a private window. A browser signed in as admin does not show the chat button.
 - Abuse protection: the rules block forged messages, fake timestamps and unread counts, but nothing can stop a script from creating many anonymous accounts. Turn on **Firebase App Check** (Build > App Check) and set a billing alert. Optional: Authentication > Settings > clear anonymous accounts automatically.
 - Reserved usernames (admin, support, staff, ...) cannot be registered. Guest names are free text, so the admin list always shows a Guest or Account badge next to a name.
+
+### Pictures in chat
+
+Visitors and the admin can attach pictures (images only) with the picture button, by pasting a screenshot, or by dragging a file onto the chat.
+
+- Every picture is re-encoded to JPEG in the browser before it is sent. That shrinks it, applies the camera rotation, and removes metadata and anything that is not pixels.
+- Each message keeps a small thumbnail (about 10-20 KB). The full picture is stored in its own document (`raizenRoyale_chats/{uid}/images/{id}`) and is only downloaded when someone opens it.
+- **Re-publish `firestore.rules`** after deploying this update (Firestore Database > Rules > Publish). Without the new rules, sending a picture is denied.
+- Each picture can take up to about 600 KB of Firestore storage and rules cannot limit how many a visitor sends. Turn on **Firebase App Check** and set a billing alert (see above), and delete old conversations from the admin tab when you no longer need them (this also deletes their pictures).

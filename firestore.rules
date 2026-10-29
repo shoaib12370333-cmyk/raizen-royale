@@ -115,32 +115,70 @@ service cloud.firestore {
       allow delete: if isAdmin();
 
       match /messages/{messageId} {
+        // A picture message holds a small inline thumbnail plus the id of its full-size picture
+        // document, which must be written in the same batch (see /images below).
+        function hasNoImage() {
+          return !('imageId' in request.resource.data) && !('thumb' in request.resource.data);
+        }
+        function hasValidImage() {
+          return request.resource.data.keys().hasAll(['imageId', 'thumb'])
+            && request.resource.data.imageId is string
+            && request.resource.data.imageId == messageId
+            && request.resource.data.imageId.matches('[A-Za-z0-9]{8,40}')
+            && request.resource.data.thumb is string
+            && request.resource.data.thumb.size() <= 60000
+            && request.resource.data.thumb.matches('data:image/jpeg;base64,.*')
+            && existsAfter(/databases/$(database)/documents/raizenRoyale_chats/$(chatId)/images/$(request.resource.data.imageId));
+        }
+
         allow read: if isOwner() || isAdmin();
 
         // Visitors can only add messages to their own conversation, as themselves, and only in the
         // same batch that updates the conversation (so there are no orphan messages and every
         // message shows up in the admin inbox).
         allow create: if isOwner()
-          && request.resource.data.keys().hasOnly(['uid', 'sender', 'text', 'createdAt'])
+          && request.resource.data.keys().hasOnly(['uid', 'sender', 'text', 'createdAt', 'imageId', 'thumb'])
           && request.resource.data.uid == request.auth.uid
           && request.resource.data.sender == 'user'
           && request.resource.data.text is string
-          && request.resource.data.text.size() > 0
           && request.resource.data.text.size() <= 1000
+          && ((hasNoImage() && request.resource.data.text.size() > 0) || hasValidImage())
           && request.resource.data.createdAt == request.time
           && getAfter(chatPath(chatId)).data.lastMessageAt == request.time
           && getAfter(chatPath(chatId)).data.lastSender == 'user';
 
         // Only the admin can write as "admin".
         allow create: if isAdmin()
-          && request.resource.data.keys().hasOnly(['uid', 'sender', 'text', 'createdAt'])
+          && request.resource.data.keys().hasOnly(['uid', 'sender', 'text', 'createdAt', 'imageId', 'thumb'])
           && request.resource.data.sender == 'admin'
           && request.resource.data.text is string
-          && request.resource.data.text.size() > 0
           && request.resource.data.text.size() <= 1000
+          && ((hasNoImage() && request.resource.data.text.size() > 0) || hasValidImage())
           && request.resource.data.createdAt == request.time;
 
         // Messages are immutable; only the admin can delete (used when clearing a conversation).
+        allow update: if false;
+        allow delete: if isAdmin();
+      }
+
+      // Full-size pictures (JPEG data URLs, re-encoded by the browser). Only downloaded when opened.
+      match /images/{imageId} {
+        allow read: if isOwner() || isAdmin();
+
+        // The picture document id equals its message id, and both are written in the same batch as the
+        // conversation update, so every picture belongs to exactly one visible message (no orphans).
+        allow create: if (isOwner() || isAdmin())
+          && request.resource.data.keys().hasOnly(['uid', 'data', 'createdAt'])
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.data is string
+          && request.resource.data.data.size() <= 700000
+          && request.resource.data.data.matches('data:image/jpeg;base64,.*')
+          && request.resource.data.createdAt == request.time
+          && getAfter(chatPath(chatId)).data.lastActivityAt == request.time
+          && existsAfter(/databases/$(database)/documents/raizenRoyale_chats/$(chatId)/messages/$(imageId))
+          && getAfter(/databases/$(database)/documents/raizenRoyale_chats/$(chatId)/messages/$(imageId)).data.imageId == imageId
+          && getAfter(/databases/$(database)/documents/raizenRoyale_chats/$(chatId)/messages/$(imageId)).data.uid == request.auth.uid;
+
         allow update: if false;
         allow delete: if isAdmin();
       }

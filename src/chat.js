@@ -40,6 +40,7 @@ import {
   writeBatch,
 } from "firebase/firestore";
 import { auth, db } from "./firebase.js";
+import { JPEG_PREFIX, imageErrorMessage } from "./imageTools.js";
 
 const CHATS = "raizenRoyale_chats";
 const ADMINS = "raizenRoyale_admins";
@@ -144,6 +145,12 @@ export function chatErrorMessage(err) {
       return "Type a message first.";
     case "app/admin-session":
       return "You are signed in as admin in this browser. Use a different browser to test chat.";
+    case "app/not-image":
+    case "app/image-too-big":
+    case "app/bad-image":
+      return imageErrorMessage(err);
+    case "app/image-gone":
+      return "This picture is no longer available.";
     default:
       return "Something went wrong. Please try again.";
   }
@@ -236,22 +243,36 @@ function normalizeMessage(snap) {
     text: String(d.text || ""),
     createdAt: ms(d.createdAt) || Date.now(),
     pending: snap.metadata.hasPendingWrites,
+    // A picture message carries a small inline thumbnail; the full image is fetched on demand (loadChatImage).
+    thumb: typeof d.thumb === "string" && d.thumb.startsWith(JPEG_PREFIX) ? d.thumb : "",
+    imageId: typeof d.imageId === "string" ? d.imageId : "",
   };
 }
 
 const chatRef = (chatId) => doc(db, CHATS, chatId);
 const messagesCol = (chatId) => collection(db, CHATS, chatId, "messages");
+const imagesCol = (chatId) => collection(db, CHATS, chatId, "images");
 
 /** Truncate by code points so an emoji is never split into a lone surrogate. */
 const cut = (s, n) => Array.from(s).slice(0, n).join("");
 
-function cleanText(text) {
+function cleanText(text, allowEmpty = false) {
   const t = String(text || "")
     .replace(/\r\n/g, "\n")
     .replace(/[​-‍⁠﻿]/g, "")
     .trim();
-  if (!t) throw appError("app/empty");
+  if (!t && !allowEmpty) throw appError("app/empty");
   return cut(t, MAX_MESSAGE_LENGTH);
+}
+
+/** What the inbox shows for a message: the text, or "Photo" / "Photo: caption" for pictures. */
+const previewFor = (t, hasImage) => (hasImage ? (t ? "Photo: " + cut(t, 100) : "Photo") : cut(t, 120));
+
+/** An image prepared by prepareImage() must be exactly {full, thumb} JPEG data URLs. */
+function assertImage(image) {
+  if (!image || typeof image.full !== "string" || typeof image.thumb !== "string" || !image.full.startsWith(JPEG_PREFIX) || !image.thumb.startsWith(JPEG_PREFIX)) {
+    throw appError("app/bad-image");
+  }
 }
 
 /* A tiny client-side cooldown for visitors. Real abuse protection needs Firebase App Check (see README). */
@@ -289,18 +310,32 @@ export async function heartbeat(identity) {
   }
 }
 
-export async function sendUserMessage(identity, text) {
-  const t = cleanText(text);
+/**
+ * Send a message as the visitor. `image` is the optional result of prepareImage(); with an image the text
+ * is just a caption and may be empty. The picture goes into its own document (loaded on demand) and the
+ * message keeps only a small thumbnail, all in ONE batch (the rules require that).
+ */
+export async function sendUserMessage(identity, text, image = null) {
+  if (image) assertImage(image);
+  const t = cleanText(text, !!image);
   assertNotTooFast();
   const batch = writeBatch(db);
-  batch.set(doc(messagesCol(identity.uid)), { uid: identity.uid, sender: "user", text: t, createdAt: serverTimestamp() });
+  const msg = { uid: identity.uid, sender: "user", text: t, createdAt: serverTimestamp() };
+  const mRef = doc(messagesCol(identity.uid));
+  if (image) {
+    // The picture document id IS the message id: the rules tie each picture to exactly one message.
+    batch.set(doc(imagesCol(identity.uid), mRef.id), { uid: identity.uid, data: image.full, createdAt: serverTimestamp() });
+    msg.imageId = mRef.id;
+    msg.thumb = image.thumb;
+  }
+  batch.set(mRef, msg);
   batch.set(
     chatRef(identity.uid),
     {
       uid: identity.uid,
       name: identity.name,
       isGuest: identity.isGuest,
-      lastMessage: cut(t, 120),
+      lastMessage: previewFor(t, !!image),
       lastMessageAt: serverTimestamp(),
       lastActivityAt: serverTimestamp(),
       lastSeenAt: serverTimestamp(),
@@ -322,12 +357,21 @@ export async function markReadByUser(identity) {
 }
 
 /* ---------- admin-side actions ---------- */
-export async function sendAdminMessage(chatId, text) {
-  const t = cleanText(text);
+export async function sendAdminMessage(chatId, text, image = null) {
+  if (image) assertImage(image);
+  const t = cleanText(text, !!image);
   const batch = writeBatch(db);
-  batch.set(doc(messagesCol(chatId)), { uid: auth.currentUser ? auth.currentUser.uid : "admin", sender: "admin", text: t, createdAt: serverTimestamp() });
+  const adminUid = auth.currentUser ? auth.currentUser.uid : "admin";
+  const msg = { uid: adminUid, sender: "admin", text: t, createdAt: serverTimestamp() };
+  const mRef = doc(messagesCol(chatId));
+  if (image) {
+    batch.set(doc(imagesCol(chatId), mRef.id), { uid: adminUid, data: image.full, createdAt: serverTimestamp() });
+    msg.imageId = mRef.id;
+    msg.thumb = image.thumb;
+  }
+  batch.set(mRef, msg);
   batch.update(chatRef(chatId), {
-    lastMessage: cut(t, 120),
+    lastMessage: previewFor(t, !!image),
     lastMessageAt: serverTimestamp(),
     lastActivityAt: serverTimestamp(),
     lastSender: "admin",
@@ -340,16 +384,36 @@ export async function markReadByAdmin(chatId) {
   await updateDoc(chatRef(chatId), { unreadAdmin: 0 });
 }
 
-/** Deletes a conversation and all of its messages. The chat doc goes first so it stops showing up straight away. */
+/** Deletes a conversation with all of its messages and pictures. The chat doc goes first so it stops showing up straight away. */
 export async function deleteChat(chatId) {
   await deleteDoc(chatRef(chatId));
-  for (let round = 0; round < 50; round += 1) {
-    const snap = await getDocs(query(messagesCol(chatId), limit(400)));
-    if (snap.empty) return;
-    const batch = writeBatch(db);
-    snap.docs.forEach((d) => batch.delete(d.ref));
-    await batch.commit();
+  for (const col of [messagesCol(chatId), imagesCol(chatId)]) {
+    for (let round = 0; round < 300; round += 1) {
+      // getDocs downloads whole documents and a picture is up to ~600 KB, so read only a few at a time.
+      const snap = await getDocs(query(col, limit(col.id === "images" ? 15 : 400)));
+      if (snap.empty) break;
+      const batch = writeBatch(db);
+      snap.docs.forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+    }
   }
+}
+
+/* Full-size pictures are fetched only when someone opens one, then kept for the session. */
+const imageCache = new Map();
+const IMAGE_CACHE_MAX = 24;
+
+/** Resolves to the full-size JPEG data URL of a picture message. */
+export async function loadChatImage(chatId, imageId) {
+  const key = chatId + "/" + imageId;
+  if (imageCache.has(key)) return imageCache.get(key);
+  const snap = await getDoc(doc(imagesCol(chatId), imageId));
+  if (!snap.exists()) throw appError("app/image-gone");
+  const data = snap.data().data;
+  if (typeof data !== "string" || !data.startsWith(JPEG_PREFIX)) throw appError("app/bad-image");
+  if (imageCache.size >= IMAGE_CACHE_MAX) imageCache.delete(imageCache.keys().next().value);
+  imageCache.set(key, data);
+  return data;
 }
 
 /* ---------- hooks ---------- */
