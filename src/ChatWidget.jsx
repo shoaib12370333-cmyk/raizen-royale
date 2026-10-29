@@ -7,6 +7,8 @@ import React, { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallba
 import "./chat-widget.css";
 import { useText } from "./text.js";
 import { Icon, Crest, Field, Spinner } from "./ui.jsx";
+import { ChatImage, AttachButton, DraftPreview, handlePasteImage, handleDragOverImage, handleDropImage } from "./ChatImage.jsx";
+import { useImageDraft, firstImageFile, imageErrorMessage } from "./imageTools.js";
 import {
   useChatIdentity,
   useOwnChat,
@@ -29,6 +31,7 @@ import {
 const HEARTBEAT_MS = 45000; // "online" refresh while the box is open and visible
 const CLOSE_MS = 200; // must match the cw-out animation
 const STICK_PX = 90; // closer than this to the bottom counts as "reading the latest"
+const PIN_MS = 1500; // after scrolling to a new message, a picture that finishes loading may still re-pin the bottom
 const GROUP_MS = 4 * 60 * 1000; // same sender within this window shares one timestamp
 const COUNTER_FROM = Math.floor(MAX_MESSAGE_LENGTH * 0.8);
 const MAX_AREA_PX = 122; // five lines of the composer (keep in sync with .cw-area in the css)
@@ -123,6 +126,44 @@ function usePageVisible() {
   }, []);
   return visible;
 }
+
+/**
+ * The picture a visitor is about to send. It lives in the widget root (not in the thread) so, like the text
+ * draft, it survives closing and reopening the panel, and it is dropped when the visitor logs out or changes.
+ * `sending` is true while a picture message is on its way: the picture stays in the draft until the send
+ * succeeded, so a failure loses nothing. `begin()` / `finish(token, ok)` bracket one send; the token (bumped
+ * whenever the visitor changes) makes a late answer for a previous visitor harmless.
+ */
+function usePictureDraft(uid) {
+  const image = useImageDraft();
+  const { clear } = image;
+  const [sending, setSending] = useState(false);
+  const epoch = useRef(0);
+  const owner = useRef(uid);
+
+  // Layout effect: the next visitor never gets to paint a frame of the previous visitor's picture.
+  useLayoutEffect(() => {
+    if (owner.current === uid) return;
+    owner.current = uid;
+    epoch.current += 1;
+    setSending(false);
+    clear();
+  }, [uid, clear]);
+
+  const begin = useCallback(() => {
+    setSending(true);
+    return epoch.current;
+  }, []);
+  const finish = useCallback((token, ok) => {
+    if (token !== epoch.current) return;
+    setSending(false);
+    if (ok) clear();
+  }, [clear]);
+
+  return { ...image, sending, begin, finish };
+}
+
+const hasFiles = (e) => !!e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files");
 
 /* Keeps the full-screen mobile sheet inside the visible area when the on-screen keyboard is up. */
 function useVisualViewportVars(ref, active) {
@@ -532,16 +573,20 @@ function AuthScreen({ upgrade, busy, setBusy, onDone, onBack }) {
 /* =========================================================
    Conversation
    ========================================================= */
-const Row = React.memo(function Row({ item, fresh }) {
+const Row = React.memo(function Row({ item, fresh, chatId, onImage }) {
   const { m, first, last } = item;
   const mine = m.sender === "user";
+  const hasPic = !!(m.imageId && m.thumb);
+  // A picture whose thumbnail is missing (should not happen) still gets a line, never an empty bubble.
+  const caption = m.text || (m.imageId && !m.thumb ? "Picture" : "");
   return (
     <div className={`cw-row ${mine ? "me" : "them"} ${first ? "first" : ""} ${last ? "last" : ""} ${fresh ? "is-new" : ""}`}>
       {mine ? null : <span className="cw-av-slot">{last ? <span className="cw-mini"><Crest size={17} glow={false} /></span> : null}</span>}
       <div className="cw-stack">
-        <div className={`cw-bubble ${m.pending ? "is-pending" : ""}`}>
+        <div className={`cw-bubble ${hasPic ? "has-pic" : ""} ${m.pending ? "is-pending" : ""}`}>
           <span className="sr-only">{mine ? "You: " : "Support: "}</span>
-          {m.text}
+          {hasPic ? <ChatImage chatId={chatId} msg={m} onLoad={onImage} /> : null}
+          {hasPic ? (caption ? <span className="cw-cap">{caption}</span> : null) : caption}
         </div>
         {last ? (
           <div className={`cw-meta ${m.pending ? "pending" : ""}`}>
@@ -570,17 +615,21 @@ function StateCard({ icon, title, text, action }) {
   );
 }
 
-function Conversation({ identity, t, blocked, onRetry, draftRef }) {
+function Conversation({ identity, t, blocked, onRetry, draftRef, pic }) {
   const { messages, loading, error } = useChatMessages(identity.uid);
   const denied = blocked || isDenied(error);
   // The draft belongs to one visitor: never hand one person's unsent text to whoever signs in next.
   const [text, setText] = useState(() => (draftRef.current.uid === identity.uid ? draftRef.current.text : ""));
   const [sendError, setSendError] = useState(null);
   const [pill, setPill] = useState(false);
+  const [dragging, setDragging] = useState(false); // a file is being dragged over the thread
 
   const listRef = useRef(null);
   const areaRef = useRef(null);
   const textRef = useRef(text);
+  const mountedRef = useRef(true);
+  const dragDepth = useRef(0);
+  const pinUntil = useRef(0); // until then a loading picture re-pins the list to the bottom
   const stickRef = useRef(true);
   const lastIdRef = useRef(null);
   const loadedRef = useRef(false);
@@ -609,14 +658,32 @@ function Conversation({ identity, t, blocked, onRetry, draftRef }) {
   const chatUid = identity.uid;
   useEffect(() => () => { draftRef.current = { uid: chatUid, text: textRef.current }; }, [draftRef, chatUid]);
 
+  // A send can finish after the panel was closed; then there is no thread left to put a failed text back into.
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
   useEffect(() => {
     if (!denied) focusSoft(areaRef.current);
   }, [denied]);
+
+  // Picture is ready: put the cursor in the composer so a caption can be typed straight away (not on phones, see focusSoft).
+  const hasDraft = !!pic.draft;
+  useEffect(() => {
+    if (hasDraft && !denied) focusSoft(areaRef.current);
+  }, [hasDraft, denied]);
 
   // Auto-growing composer (max five lines, then it scrolls).
   useLayoutEffect(() => {
     const ta = areaRef.current;
     if (!ta) return;
+    // Empty box: let the CSS min-height decide. While the panel is animating in, the textarea can be
+    // measured at a tiny width, and a wrapping placeholder would otherwise inflate scrollHeight.
+    if (!text) {
+      ta.style.height = "";
+      return;
+    }
     ta.style.height = "auto";
     ta.style.height = `${Math.min(ta.scrollHeight, MAX_AREA_PX)}px`;
   }, [text, denied]);
@@ -639,6 +706,7 @@ function Conversation({ identity, t, blocked, onRetry, draftRef }) {
       loadedRef.current = true;
       lastIdRef.current = lastId;
       stickRef.current = true;
+      pinUntil.current = Date.now() + PIN_MS;
       el.scrollTop = el.scrollHeight;
       return;
     }
@@ -647,6 +715,7 @@ function Conversation({ identity, t, blocked, onRetry, draftRef }) {
     if (!last) return;
     if (last.sender === "user" || stickRef.current) {
       stickRef.current = true;
+      pinUntil.current = Date.now() + PIN_MS;
       scrollToBottom(true);
       setPill(false);
     } else {
@@ -665,6 +734,19 @@ function Conversation({ identity, t, blocked, onRetry, draftRef }) {
     return () => ro.disconnect();
   }, [denied]);
 
+  // A thumbnail gets its size only after it has loaded, i.e. after its message was appended and scrolled to.
+  // If the visitor was following the latest messages, pin the bottom again (stable identity keeps Row memoized).
+  // The grace window covers the smooth scroll to a new message: while it runs, onScroll can briefly decide the visitor
+  // is no longer at the bottom, which must not stop the picture from being scrolled into view.
+  const onImage = useCallback(() => {
+    const el = listRef.current;
+    if (!el) return;
+    if (stickRef.current || Date.now() < pinUntil.current) {
+      stickRef.current = true;
+      el.scrollTop = el.scrollHeight;
+    }
+  }, []);
+
   const onScroll = () => {
     const el = listRef.current;
     if (!el) return;
@@ -680,18 +762,88 @@ function Conversation({ identity, t, blocked, onRetry, draftRef }) {
     if (areaRef.current) areaRef.current.focus({ preventScroll: true });
   };
 
-  const send = () => {
-    const body = text.trim();
+  // The text of a message that failed goes back into the composer (or, if the thread was closed meanwhile, into the saved draft).
+  const restoreText = (body) => {
     if (!body) return;
+    if (!mountedRef.current) {
+      const d = draftRef.current;
+      if (d.uid === identity.uid && !d.text.trim()) draftRef.current = { uid: identity.uid, text: body };
+      return;
+    }
+    setText((cur) => (cur.trim() ? `${body}\n${cur}`.slice(0, MAX_MESSAGE_LENGTH) : body));
+  };
+
+  const send = () => {
+    if (pic.busy || pic.sending) return; // the picture is still being prepared, or the previous one is still on its way
+    const body = text.trim();
+    const img = pic.draft;
+    if (!body && !img) return;
     setSendError(null);
     setText(""); // the message shows up immediately as "sending"; the text comes back if it fails
     stickRef.current = true;
-    if (areaRef.current) areaRef.current.focus({ preventScroll: true });
-    sendUserMessage(identity, body).catch((err) => {
-      if (err && err.code === "app/empty") return;
-      setText((cur) => (cur.trim() ? `${body}\n${cur}`.slice(0, MAX_MESSAGE_LENGTH) : body));
-      setSendError({ msg: friendlyError(err), n: Date.now() });
-    });
+    // Keep the cursor in the composer. On a touch screen only if it is already there: a picture-only send (gallery -> Send)
+    // would otherwise pop the keyboard up over the photo that was just sent.
+    if (areaRef.current && (!coarsePointer() || document.activeElement === areaRef.current)) areaRef.current.focus({ preventScroll: true });
+    // The picture stays in the draft until the send succeeded; a failure keeps it (and the text) for another try.
+    const token = img ? pic.begin() : 0;
+    if (!img && pic.error) pic.clear(); // a text message also dismisses a leftover "could not read that picture" note
+    sendUserMessage(identity, body, img || null).then(
+      () => {
+        if (img) pic.finish(token, true);
+      },
+      (err) => {
+        if (img) pic.finish(token, false);
+        if (err && err.code === "app/empty") return;
+        restoreText(body);
+        if (mountedRef.current) setSendError({ msg: friendlyError(err), n: Date.now() });
+      }
+    );
+  };
+
+  // A picture can come from the attach button, a paste or a drop. Nothing new is accepted while one is being sent.
+  const pickImage = (input) => {
+    if (pic.sending) return;
+    // Not a picture, while a picture is already waiting: say so here. The draft's own error row has a dismiss button that
+    // also throws the waiting picture away.
+    if (pic.draft && input && typeof input.length === "number" && !input.type && !firstImageFile(input)) {
+      setSendError({ msg: imageErrorMessage({ code: "app/not-image" }), n: Date.now() });
+      return;
+    }
+    pic.pick(input);
+  };
+
+  // A screenshot or a copied picture is attached. Cells copied from Excel or Word also bring a picture of themselves,
+  // but they bring text too: whenever the clipboard has text, paste the text as usual.
+  const onPaste = (e) => {
+    const cd = e.clipboardData;
+    if (cd && cd.getData && cd.getData("text/plain").trim()) return;
+    handlePasteImage(e, pickImage);
+  };
+
+  const dragEnd = () => {
+    dragDepth.current = 0;
+    setDragging(false);
+  };
+  const onDragEnter = (e) => {
+    if (!hasFiles(e)) return;
+    dragDepth.current += 1;
+    if (!pic.sending) setDragging(true);
+  };
+  const onDragLeave = (e) => {
+    if (!hasFiles(e)) return;
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDragging(false);
+  };
+  const onDragOver = (e) => handleDragOverImage(e);
+  const onDrop = (e) => {
+    dragEnd();
+    if (!hasFiles(e)) return; // dropped text or a link: leave it to the browser
+    handleDropImage(e, pickImage);
+    if (!e.defaultPrevented) {
+      // Not a picture. Swallow the drop anyway (the browser would otherwise open the file and leave the site) and let the hook say so.
+      e.preventDefault();
+      pickImage(e.dataTransfer.files);
+    }
   };
 
   const onKeyDown = (e) => {
@@ -724,6 +876,7 @@ function Conversation({ identity, t, blocked, onRetry, draftRef }) {
 
   const len = text.length;
   const showCount = len >= COUNTER_FROM;
+  const canSend = !pic.busy && !pic.sending && (!!text.trim() || !!pic.draft);
 
   // The welcome bubble stays until the team has replied once ("shown before the first reply").
   // With no messages it stands alone; otherwise it sits right under the first day separator.
@@ -738,7 +891,13 @@ function Conversation({ identity, t, blocked, onRetry, draftRef }) {
     ) : null;
 
   return (
-    <div className="cw-convo">
+    <div
+      className={`cw-convo ${dragging ? "is-drop" : ""}`}
+      onDragEnter={onDragEnter}
+      onDragLeave={onDragLeave}
+      onDragOver={onDragOver}
+      onDrop={onDrop}
+    >
       <div className="cw-listwrap">
         <div className="cw-list" ref={listRef} onScroll={onScroll} role="log" aria-live="polite" aria-label="Conversation with support" tabIndex={0}>
           {loading ? (
@@ -755,7 +914,7 @@ function Conversation({ identity, t, blocked, onRetry, draftRef }) {
               {it.type === "day" ? (
                 <div className="cw-day"><span>{it.label}</span></div>
               ) : (
-                <Row item={it} fresh={freshRef.current.has(it.m.id)} />
+                <Row item={it} fresh={freshRef.current.has(it.m.id)} chatId={identity.uid} onImage={onImage} />
               )}
               {i === 0 ? welcome : null}
             </React.Fragment>
@@ -768,6 +927,13 @@ function Conversation({ identity, t, blocked, onRetry, draftRef }) {
         ) : null}
       </div>
 
+      {dragging ? (
+        <div className="cw-drop" aria-hidden="true">
+          <Icon name="image" size={28} />
+          <span>Drop a picture to attach it</span>
+        </div>
+      ) : null}
+
       <div className="cw-composer">
         {sendError ? (
           <div className="error-box cw-err" role="alert" key={sendError.n}>
@@ -775,7 +941,15 @@ function Conversation({ identity, t, blocked, onRetry, draftRef }) {
             <span>{sendError.msg}</span>
           </div>
         ) : null}
+        {pic.sending ? (
+          <div className="ci-draft" role="status">
+            <div className="ci-draft-row"><Spinner /> <span>Sending picture...</span></div>
+          </div>
+        ) : (
+          <DraftPreview draft={pic.draft} busy={pic.busy} error={pic.error} onClear={pic.clear} />
+        )}
         <div className="cw-compose">
+          <AttachButton onPick={pickImage} disabled={pic.sending} />
           <textarea
             ref={areaRef}
             className="cw-area"
@@ -783,13 +957,14 @@ function Conversation({ identity, t, blocked, onRetry, draftRef }) {
             value={text}
             onChange={onChange}
             onKeyDown={onKeyDown}
+            onPaste={onPaste}
             placeholder={t.chatPlaceholder}
-            aria-label="Type your message"
+            aria-label={pic.draft ? "Add a caption (optional)" : "Type your message"}
             maxLength={MAX_MESSAGE_LENGTH}
             enterKeyHint="send"
             autoComplete="off"
           />
-          <button type="button" className="cw-send" onMouseDown={(e) => e.preventDefault()} onClick={send} disabled={!text.trim()} aria-label="Send message">
+          <button type="button" className="cw-send" onMouseDown={(e) => e.preventDefault()} onClick={send} disabled={!canSend} aria-label="Send message">
             <SendIcon />
           </button>
         </div>
@@ -819,6 +994,7 @@ export default function ChatWidget() {
   const name = rawIdentity ? rawIdentity.name : "";
   const isGuest = rawIdentity ? rawIdentity.isGuest : false;
   const identity = useMemo(() => (uid ? { uid, name, isGuest } : null), [uid, name, isGuest]);
+  const pic = usePictureDraft(uid); // the picture waiting to be sent: kept while the panel is closed, dropped when the visitor changes
 
   const [phase, setPhase] = useState("closed"); // closed | open | closing
   const [busy, setBusy] = useState(false); // a sign-in / sign-up is in flight
@@ -927,7 +1103,7 @@ export default function ChatWidget() {
       />
     );
   } else {
-    body = <Conversation key={`${live.uid}:${nonce}`} identity={live} t={t} blocked={blocked} onRetry={onRetry} draftRef={draftRef} />;
+    body = <Conversation key={`${live.uid}:${nonce}`} identity={live} t={t} blocked={blocked} onRetry={onRetry} draftRef={draftRef} pic={pic} />;
   }
 
   const badge = unread > 99 ? "99+" : String(unread);

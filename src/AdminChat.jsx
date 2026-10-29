@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import React, { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } from "react";
 import "./admin-chat.css";
 import { auth, onAuthStateChanged } from "./firebase.js";
 import { Icon, Spinner, Switch, useToast } from "./ui.jsx";
@@ -9,8 +9,11 @@ import {
   deleteChat,
   isOnline,
   isChatUser,
+  chatErrorMessage,
   MAX_MESSAGE_LENGTH,
 } from "./chat.js";
+import { useImageDraft, firstImageFile } from "./imageTools.js";
+import { ChatImage, AttachButton, DraftPreview, handlePasteImage, handleDragOverImage, handleDropImage } from "./ChatImage.jsx";
 
 /* =========================================================
    Constants + small helpers
@@ -46,6 +49,11 @@ function Glyph({ name, size = 18 }) {
     </svg>
   );
 }
+
+// chat.lastMessage is "Photo" or "Photo: caption" for a picture message (see previewFor in chat.js).
+const isPhotoPreview = (s) => /^Photo(?::|$)/.test(String(s || ""));
+// True while a drag carries files (as opposed to text or a link being dragged around the page).
+const dragHasFiles = (e) => !!(e.dataTransfer && e.dataTransfer.types && Array.from(e.dataTransfer.types).includes("Files"));
 
 const isTabVisible = () => typeof document === "undefined" || document.visibilityState !== "hidden";
 const isCoarsePointer = () => typeof window !== "undefined" && !!window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
@@ -92,6 +100,14 @@ function errText(err) {
 
 const isPermissionError = (e) =>
   !!e && (e.code === "permission-denied" || e.code === "firestore/permission-denied" || /missing or insufficient permissions|insufficient permissions/i.test(String(e.message || "")));
+
+/** Like errText, with picture-specific wording (a refused picture usually means the rules were not republished). */
+function pictureErrText(err) {
+  const code = (err && err.code) || "";
+  if (code === "app/not-image" || code === "app/image-too-big" || code === "app/bad-image" || code === "app/image-gone") return chatErrorMessage(err);
+  if (isPermissionError(err)) return "Permission denied while sending the picture. Publish the latest firestore.rules (they now allow pictures) and try again.";
+  return errText(err);
+}
 
 async function copyText(text) {
   try {
@@ -177,6 +193,16 @@ function CopyField({ label, value, emptyText = "Not available" }) {
     </div>
   );
 }
+
+/**
+ * A picture thumbnail that re-renders only when the picture itself changes. ChatImage gives its full-size viewer a
+ * fresh onClose on every render, and the viewer re-focuses its Close button whenever that changes, so without this the
+ * 15 s clock tick or any incoming message would pull focus back to Close while someone is using the open viewer.
+ */
+const Thumb = React.memo(function Thumb({ chatId, thumb, imageId, onLoad }) {
+  const msg = useMemo(() => ({ thumb, imageId }), [thumb, imageId]);
+  return <ChatImage chatId={chatId} msg={msg} onLoad={onLoad} />;
+});
 
 /* =========================================================
    Setup / error states
@@ -316,6 +342,7 @@ function ChatRow({ chat, active, now, onSelect }) {
             {chat.lastMessage ? (
               <>
                 {chat.lastSender === "admin" ? <span className="you">You: </span> : null}
+                {isPhotoPreview(chat.lastMessage) ? <span className="ac-pic-ico" aria-hidden="true"><Icon name="image" size={14} /></span> : null}
                 {chat.lastMessage}
               </>
             ) : (
@@ -441,6 +468,12 @@ function Conversation({ chat, now, drafts, onBack, onDeleted }) {
     setNewBelow(false);
     scrollToBottom();
   };
+  // A picture lays out after its message is appended (the list was already scrolled by then), so each
+  // thumbnail re-pins the bottom when the admin had not scrolled up. Stable, so the memoized thumbnails keep still.
+  const repin = useCallback(() => {
+    const el = scrollRef.current;
+    if (el && stickRef.current) el.scrollTop = el.scrollHeight;
+  }, []);
 
   useLayoutEffect(() => {
     if (loading) return;
@@ -488,6 +521,16 @@ function Conversation({ chat, now, drafts, onBack, onDeleted }) {
   const sending = inflightSends > 0;
   const [sendError, setSendError] = useState("");
 
+  // One picture can wait in the composer. This component is mounted per chat id, so it resets on its own
+  // when the admin opens another conversation.
+  const pic = useImageDraft();
+  const picRef = useRef(pic);
+  picRef.current = pic;
+  const picInflight = useRef(false); // the waiting picture is being sent: do not send it twice
+  const [picSending, setPicSending] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const dragDepth = useRef(0);
+
   useEffect(() => {
     if (text) drafts.current[chat.id] = text;
     else delete drafts.current[chat.id];
@@ -509,29 +552,77 @@ function Conversation({ chat, now, drafts, onBack, onDeleted }) {
     el.style.height = Math.min(el.scrollHeight + 2, MAX_TEXTAREA_PX) + "px";
   }, [text]);
 
+  // Text, or a picture that is ready (and not already on its way), can be sent. Not while compressing or deleting.
+  const canSend = !!(text.trim() || (pic.draft && !picSending)) && !pic.busy && !deleting;
+
   const submit = async () => {
     const draft = text.trim();
-    if (!draft || deleting) return;
+    // With a picture the text is just its caption. A waiting picture goes out once: while it is on its way only plain text can follow.
+    const image = pic.draft && !picInflight.current ? pic.draft : null;
+    if ((!draft && !image) || pic.busy || deleting) return;
     setInflightSends((n) => n + 1);
     setSendError("");
     setText("");
     stickRef.current = true;
+    if (image) {
+      picInflight.current = true;
+      setPicSending(true);
+    }
     try {
-      await sendAdminMessage(chat.id, draft);
+      await sendAdminMessage(chat.id, draft, image);
+      // The picture leaves the composer only once it is saved (unless the admin already swapped it for another one).
+      if (image && mounted.current && picRef.current.draft === image) picRef.current.clear();
     } catch (err) {
       if (!mounted.current) {
         // The admin already moved to another conversation: park the text as this conversation's draft.
-        const kept = drafts.current[chat.id];
-        drafts.current[chat.id] = (kept ? `${draft}\n${kept}` : draft).slice(0, MAX_MESSAGE_LENGTH);
+        if (draft) {
+          const kept = drafts.current[chat.id];
+          drafts.current[chat.id] = (kept ? `${draft}\n${kept}` : draft).slice(0, MAX_MESSAGE_LENGTH);
+        }
+        if (image) toast(`The picture for ${chat.name} was not sent. ${pictureErrText(err)}`, "bad");
         return;
       }
-      // Give the text back so nothing is lost.
-      setText((cur) => (cur ? `${draft}\n${cur}` : draft).slice(0, MAX_MESSAGE_LENGTH));
-      setSendError(errText(err));
+      // Give the text back so nothing is lost (the picture never left the composer).
+      if (draft) setText((cur) => (cur ? `${draft}\n${cur}` : draft).slice(0, MAX_MESSAGE_LENGTH));
+      setSendError(image ? pictureErrText(err) : errText(err));
     } finally {
+      if (image) {
+        picInflight.current = false;
+        setPicSending(false);
+      }
       setInflightSends((n) => n - 1);
       if (!coarse && taRef.current) taRef.current.focus({ preventScroll: true });
     }
+  };
+
+  /* ----- paste (Ctrl+V a screenshot) and drag-and-drop onto the conversation ----- */
+  const onPaste = (e) => {
+    if (deleting) return;
+    // Copying from a spreadsheet or Word also puts a rendered picture of the text on the clipboard: keep pasting the text.
+    const cd = e.clipboardData;
+    if (cd && cd.getData("text/plain") && cd.getData("text/html")) return;
+    handlePasteImage(e, pic.pick);
+  };
+  const onDragEnter = (e) => {
+    if (!dragHasFiles(e) || deleting) return;
+    dragDepth.current += 1; // enter/leave also fire for every child element, so count them
+    setDragging(true);
+  };
+  const onDragOver = (e) => handleDragOverImage(e);
+  const onDragLeave = () => {
+    // No types check here: some browsers hide them on dragleave, and the depth is only above 0 during a file drag.
+    if (dragDepth.current === 0) return;
+    dragDepth.current -= 1;
+    if (dragDepth.current === 0) setDragging(false);
+  };
+  const onDrop = (e) => {
+    if (!dragHasFiles(e)) return; // dragged text or a link: leave it to the browser
+    dragDepth.current = 0;
+    setDragging(false);
+    e.preventDefault(); // never let the browser open a dropped file in this tab
+    if (deleting) return;
+    if (firstImageFile(e.dataTransfer.files)) handleDropImage(e, pic.pick);
+    else pic.pick(e.dataTransfer.files); // not a picture: shows the friendly "only pictures" message
   };
 
   const onKeyDown = (e) => {
@@ -560,7 +651,14 @@ function Conversation({ chat, now, drafts, onBack, onDeleted }) {
   const count = text.length;
 
   return (
-    <section className="ac-convo" aria-label={`Conversation with ${chat.name}`}>
+    <section
+      className={`ac-convo${dragging ? " dragging" : ""}`}
+      aria-label={`Conversation with ${chat.name}`}
+      onDragEnter={onDragEnter}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
       <header className="ac-head">
         <button type="button" className="btn btn-ghost btn-icon ac-back" onClick={onBack} aria-label="Back to conversations">
           <Icon name="arrow" size={18} />
@@ -624,11 +722,15 @@ function Conversation({ chat, now, drafts, onBack, onDeleted }) {
               }
               const m = it.m;
               const mine = m.sender === "admin";
+              const hasPic = !!(m.imageId && m.thumb);
+              // A message that points at a picture we cannot show should not render as an empty bubble.
+              const body = m.text || (!hasPic && (m.imageId || m.thumb) ? "Picture unavailable" : "");
               return (
                 <div key={it.key} className={`ac-msg ${mine ? "mine" : "theirs"}${it.first ? " first" : ""}${it.last ? " last" : ""}${m.pending ? " pending" : ""}`}>
-                  <div className="ac-bubble" title={fullStamp(m.createdAt)}>
+                  <div className={`ac-bubble${hasPic ? (body ? " has-pic" : " has-pic pic-only") : ""}`} title={fullStamp(m.createdAt)}>
                     <span className="sr-only">{mine ? "You: " : `${chat.name}: `}</span>
-                    {m.text}
+                    {hasPic ? <Thumb chatId={chat.id} thumb={m.thumb} imageId={m.imageId} onLoad={repin} /> : null}
+                    {hasPic ? (body ? <span className="ac-cap">{body}</span> : null) : body}
                   </div>
                   {it.last || (mine && m.pending) ? (
                     <div className="ac-meta">
@@ -665,32 +767,47 @@ function Conversation({ chat, now, drafts, onBack, onDeleted }) {
             <span>{sendError}</span>
           </div>
         ) : null}
+        {picSending ? (
+          <div className="ci-draft" role="status">
+            <div className="ci-draft-row"><Spinner /> <span>Sending picture...</span></div>
+          </div>
+        ) : (
+          <DraftPreview draft={pic.draft} busy={pic.busy} error={pic.error} onClear={pic.clear} />
+        )}
         <form onSubmit={(e) => { e.preventDefault(); submit(); }}>
           <div className="ac-compose-row">
+            <AttachButton onPick={pic.pick} disabled={deleting || picSending} className="ac-attach" />
             <textarea
               ref={taRef}
               className="textarea ac-textarea"
               value={text}
               onChange={(e) => { setText(e.target.value); if (sendError) setSendError(""); }}
               onKeyDown={onKeyDown}
-              placeholder={`Reply to ${chat.name}...`}
-              aria-label={`Reply to ${chat.name}`}
+              onPaste={onPaste}
+              placeholder={pic.draft ? "Add a caption (optional)..." : `Reply to ${chat.name}...`}
+              aria-label={pic.draft ? `Add a caption (optional) for the picture to ${chat.name}` : `Reply to ${chat.name}`}
               rows={1}
               maxLength={MAX_MESSAGE_LENGTH}
               disabled={deleting}
             />
-            <button type="submit" className="btn btn-gold ac-send" disabled={!text.trim() || deleting} aria-label="Send message" title="Send message">
+            <button type="submit" className="btn btn-gold ac-send" disabled={!canSend} aria-label="Send message" title="Send message">
               {sending ? <Spinner /> : <Glyph name="send" size={19} />}
             </button>
           </div>
           <div className="ac-compose-foot">
-            <span className="hint">{coarse ? "Tap send to reply" : "Enter to send, Shift+Enter for a new line"}</span>
+            <span className="hint">{coarse ? "Tap send to reply" : "Enter to send, Shift+Enter for a new line. Paste or drop a picture to attach it."}</span>
             <span className={`ac-count${count >= MAX_MESSAGE_LENGTH ? " bad" : count >= MAX_MESSAGE_LENGTH * 0.9 ? " warn" : ""}`}>
               {count}/{MAX_MESSAGE_LENGTH}<span className="sr-only"> characters used</span>
             </span>
           </div>
         </form>
       </div>
+
+      {dragging ? (
+        <div className="ac-drop" aria-hidden="true">
+          <span><Icon name="image" size={20} /> Drop a picture to attach it</span>
+        </div>
+      ) : null}
     </section>
   );
 }

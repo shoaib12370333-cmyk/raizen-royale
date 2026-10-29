@@ -75,6 +75,8 @@
 .ac-root .ac-preview { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: var(--text-dim); }
 .ac-root .ac-preview i { font-style: italic; color: var(--text-faint); }
 .ac-root .ac-preview .you { color: var(--text-faint); }
+.ac-root .ac-preview .ac-pic-ico { display: inline-block; margin-right: 5px; vertical-align: -2px; color: var(--text-faint); }
+.ac-root .ac-preview .ac-pic-ico svg { display: block; }
 .ac-root .ac-row.unread .ac-preview { color: var(--text); font-weight: 600; }
 .ac-root .ac-side { display: flex; flex-direction: column; align-items: flex-end; justify-content: center; gap: 6px; flex-shrink: 0; min-height: 34px; }
 .ac-root .ac-time { font-size: 11.5px; font-weight: 700; color: var(--text-faint); white-space: nowrap; }
@@ -93,7 +95,7 @@
 .ac-root .ac-empty .btn { margin-top: 12px; }
 
 /* ---------- conversation pane ---------- */
-.ac-root .ac-convo { min-width: 0; min-height: 0; display: flex; flex-direction: column; container-type: inline-size; container-name: acconvo; }
+.ac-root .ac-convo { position: relative; min-width: 0; min-height: 0; display: flex; flex-direction: column; container-type: inline-size; container-name: acconvo; }
 .ac-root .ac-placeholder { align-items: center; justify-content: center; }
 .ac-root .ac-placeholder .empty { max-width: 340px; }
 .ac-root .ac-placeholder .empty b { display: block; color: var(--text); font-size: 16px; margin-bottom: 4px; }
@@ -147,6 +149,12 @@
 }
 .ac-root .ac-msg.mine:not(.first) .ac-bubble { border-top-right-radius: 6px; }
 .ac-root .ac-msg.pending .ac-bubble { opacity: 0.72; }
+/* picture messages: the thumbnail sits in a snug frame, the caption (if any) underneath */
+.ac-root .ac-bubble.has-pic { padding: 5px; }
+.ac-root .ac-bubble.pic-only { padding: 4px; } /* no caption: a thin frame, not a big empty bubble */
+.ac-root .ac-bubble .ac-cap { display: block; margin-top: 7px; padding: 0 9px 3px; }
+.ac-root .ac-msg.mine .ac-bubble .ci-thumb { border-color: rgba(28, 19, 5, 0.28); }
+.ac-root .ac-msg.mine .ac-bubble .ci-thumb:hover { border-color: rgba(28, 19, 5, 0.6); box-shadow: 0 10px 24px -12px rgba(28, 19, 5, 0.6); }
 .ac-root .ac-meta { display: flex; align-items: center; gap: 6px; margin-top: 4px; padding: 0 4px; font-size: 11px; font-weight: 700; color: var(--text-faint); }
 .ac-root .ac-meta .spinner { width: 10px; height: 10px; border-width: 1.5px; }
 @keyframes ac-in { from { opacity: 0; transform: translateY(6px); } }
@@ -175,6 +183,26 @@
 .ac-root .ac-compose-row { display: flex; align-items: flex-end; gap: 10px; }
 .ac-root .ac-textarea { flex: 1; min-width: 0; min-height: 46px; max-height: 140px; padding: 12px 16px; border-radius: 16px; resize: none; overflow-y: auto; line-height: 1.45; font-size: 14.5px; }
 .ac-root .ac-send { --h: 46px; flex-shrink: 0; width: 46px; padding: 0; border-radius: 15px; }
+.ac-root .ac-compose-row .ci-attach { width: 46px; height: 46px; border-radius: 15px; }
+.ac-root .ac-composer .ci-draft { margin: 0; } /* the composer's own gap spaces it */
+.ac-root .ac-compose-foot .hint { min-width: 0; }
+
+/* dropping a picture on the conversation */
+.ac-root .ac-drop {
+  position: absolute; inset: 0; z-index: 6; display: grid; place-items: center; pointer-events: none;
+  background: rgba(10, 8, 14, 0.5); animation: ac-fade 0.15s ease both;
+}
+.ac-root .ac-drop::before {
+  content: ""; position: absolute; inset: 8px; border-radius: 16px;
+  border: 2px dashed rgba(246, 210, 122, 0.55); background: rgba(246, 210, 122, 0.06);
+}
+.ac-root .ac-drop span {
+  position: relative; display: inline-flex; align-items: center; gap: 10px; padding: 10px 16px; border-radius: 99px;
+  font-size: 13.5px; font-weight: 800; color: var(--gold-1);
+  background: rgba(16, 12, 20, 0.92); border: 1px solid rgba(246, 210, 122, 0.55);
+  box-shadow: 0 14px 30px -10px rgba(0, 0, 0, 0.9), 0 0 24px -6px rgba(246, 210, 122, 0.4);
+}
+@keyframes ac-fade { from { opacity: 0; } }
 .ac-root .ac-compose-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 6px; padding: 0 4px; }
 .ac-root .ac-compose-foot .hint { font-size: 11.5px; }
 .ac-root .ac-count { font-size: 11.5px; font-weight: 700; color: var(--text-faint); font-variant-numeric: tabular-nums; }
@@ -261,6 +289,10 @@
   .ac-root .ac-msg { max-width: 88%; }
   .ac-root .ac-head { padding: 10px 12px; gap: 10px; }
   .ac-root .ac-composer { padding: 8px 12px 10px; }
+  .ac-root .ac-compose-row { gap: 8px; }
+  .ac-root .ac-composer .ci-draft-row { gap: 10px; padding: 6px 8px 6px 6px; }
+  .ac-root .ac-composer .ci-draft-row img { width: 44px; height: 44px; }
+  .ac-root .ac-bubble .ac-cap { padding: 0 7px 2px; }
   .ac-setup .ac-setup-hero { padding: 22px 20px; }
   .ac-setup .ac-setup-body { padding: 20px; }
   .ac-setup .ac-step { grid-template-columns: 30px minmax(0, 1fr); gap: 12px; }
@@ -269,11 +301,17 @@
   .ac-setup .ac-copy { flex-wrap: wrap; }
 }
 
+/* Very narrow phones: attach + textarea + send still have to fit side by side. */
+@media (max-width: 380px) {
+  .ac-root .ac-compose-row { gap: 6px; }
+  .ac-root .ac-compose-row .ci-attach, .ac-root .ac-send { width: 42px; }
+}
+
 /* 16px inputs stop iOS Safari from zooming the page when the keyboard opens. */
 @media (pointer: coarse) {
   .ac-root .ac-textarea, .ac-root .ac-search .input { font-size: 16px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .ac-root .ac-msg, .ac-root .ac-newpill, .ac-root .ac-pdot { animation: none; }
+  .ac-root .ac-msg, .ac-root .ac-newpill, .ac-root .ac-pdot, .ac-root .ac-drop { animation: none; }
 }
